@@ -10,13 +10,17 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import os
+from pathlib import Path
+
 import numpy as np
 
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Replay motion from csv file and output to npz file.")
-parser.add_argument("--input_file", type=str, required=True, help="The path to the input motion csv file.")
+parser.add_argument("--input_file", type=str, help="The path to one input motion CSV file.")
+parser.add_argument("--input_dir", type=str, help="Convert every CSV file in this directory.")
 parser.add_argument("--input_fps", type=int, default=30, help="The fps of the input motion.")
 parser.add_argument(
     "--frame_range",
@@ -28,13 +32,31 @@ parser.add_argument(
         " loaded."
     ),
 )
-parser.add_argument("--output_name", type=str, required=True, help="The name of the motion npz file.")
+parser.add_argument("--output_name", type=str, help="The name of the motion NPZ file or WandB artifact.")
+parser.add_argument(
+    "--output_file",
+    type=str,
+    help="Write the processed motion to this local NPZ file instead of uploading it to WandB.",
+)
+parser.add_argument(
+    "--robot_file",
+    type=str,
+    help="Optional URDF file to use instead of the project's default G1 model.",
+)
+parser.add_argument("--output_dir", type=str, help="Local output directory used together with --input_dir.")
 parser.add_argument("--output_fps", type=int, default=50, help="The fps of the output motion.")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
+
+if bool(args_cli.input_file) == bool(args_cli.input_dir):
+    parser.error("Provide exactly one of --input_file or --input_dir.")
+if args_cli.input_dir and not args_cli.output_dir:
+    parser.error("--output_dir is required with --input_dir.")
+if args_cli.input_file and not (args_cli.output_file or args_cli.output_name):
+    parser.error("Provide --output_file for local output or --output_name for WandB output.")
 
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
@@ -56,6 +78,9 @@ from isaaclab.utils.math import axis_angle_from_quat, quat_conjugate, quat_mul, 
 # Pre-defined configs
 ##
 from whole_body_tracking.robots.g1 import G1_CYLINDER_CFG
+
+if args_cli.robot_file:
+    G1_CYLINDER_CFG.spawn.asset_path = args_cli.robot_file
 
 
 @configclass
@@ -217,68 +242,68 @@ class MotionLoader:
 
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joint_names: list[str]):
     """Runs the simulation loop."""
-    # Load motion
-    motion = MotionLoader(
-        motion_file=args_cli.input_file,
-        input_fps=args_cli.input_fps,
-        output_fps=args_cli.output_fps,
-        device=sim.device,
-        frame_range=args_cli.frame_range,
-    )
-
     # Extract scene entities
     robot = scene["robot"]
     robot_joint_indexes = robot.find_joints(joint_names, preserve_order=True)[0]
 
-    # ------- data logger -------------------------------------------------------
-    log = {
-        "fps": [args_cli.output_fps],
-        "joint_pos": [],
-        "joint_vel": [],
-        "body_pos_w": [],
-        "body_quat_w": [],
-        "body_lin_vel_w": [],
-        "body_ang_vel_w": [],
-    }
-    file_saved = False
-    # --------------------------------------------------------------------------
+    if args_cli.input_dir:
+        input_files = sorted(Path(args_cli.input_dir).glob("*.csv"))
+        if not input_files:
+            raise FileNotFoundError(f"No CSV files found in: {args_cli.input_dir}")
+        output_dir = Path(args_cli.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        jobs = [(path, output_dir / f"{path.stem}.npz") for path in input_files]
+    else:
+        jobs = [(Path(args_cli.input_file), Path(args_cli.output_file) if args_cli.output_file else None)]
 
-    # Simulation loop
-    while simulation_app.is_running():
-        (
+    for job_index, (motion_file, output_file) in enumerate(jobs, start=1):
+        print(f"[INFO]: Converting {job_index}/{len(jobs)}: {motion_file.name}", flush=True)
+        motion = MotionLoader(
+            motion_file=str(motion_file),
+            input_fps=args_cli.input_fps,
+            output_fps=args_cli.output_fps,
+            device=sim.device,
+            frame_range=args_cli.frame_range,
+        )
+        log = {
+            "fps": [args_cli.output_fps],
+            "joint_pos": [],
+            "joint_vel": [],
+            "body_pos_w": [],
+            "body_quat_w": [],
+            "body_lin_vel_w": [],
+            "body_ang_vel_w": [],
+        }
+
+        while simulation_app.is_running():
             (
-                motion_base_pos,
-                motion_base_rot,
-                motion_base_lin_vel,
-                motion_base_ang_vel,
-                motion_dof_pos,
-                motion_dof_vel,
-            ),
-            reset_flag,
-        ) = motion.get_next_state()
+                (
+                    motion_base_pos,
+                    motion_base_rot,
+                    motion_base_lin_vel,
+                    motion_base_ang_vel,
+                    motion_dof_pos,
+                    motion_dof_vel,
+                ),
+                reset_flag,
+            ) = motion.get_next_state()
 
-        # set root state
-        root_states = robot.data.default_root_state.clone()
-        root_states[:, :3] = motion_base_pos
-        root_states[:, :2] += scene.env_origins[:, :2]
-        root_states[:, 3:7] = motion_base_rot
-        root_states[:, 7:10] = motion_base_lin_vel
-        root_states[:, 10:] = motion_base_ang_vel
-        robot.write_root_state_to_sim(root_states)
+            root_states = robot.data.default_root_state.clone()
+            root_states[:, :3] = motion_base_pos
+            root_states[:, :2] += scene.env_origins[:, :2]
+            root_states[:, 3:7] = motion_base_rot
+            root_states[:, 7:10] = motion_base_lin_vel
+            root_states[:, 10:] = motion_base_ang_vel
+            robot.write_root_state_to_sim(root_states)
 
-        # set joint state
-        joint_pos = robot.data.default_joint_pos.clone()
-        joint_vel = robot.data.default_joint_vel.clone()
-        joint_pos[:, robot_joint_indexes] = motion_dof_pos
-        joint_vel[:, robot_joint_indexes] = motion_dof_vel
-        robot.write_joint_state_to_sim(joint_pos, joint_vel)
-        sim.render()  # We don't want physic (sim.step())
-        scene.update(sim.get_physics_dt())
+            joint_pos = robot.data.default_joint_pos.clone()
+            joint_vel = robot.data.default_joint_vel.clone()
+            joint_pos[:, robot_joint_indexes] = motion_dof_pos
+            joint_vel[:, robot_joint_indexes] = motion_dof_vel
+            robot.write_joint_state_to_sim(joint_pos, joint_vel)
+            sim.render()  # We don't want physics (sim.step()).
+            scene.update(sim.get_physics_dt())
 
-        pos_lookat = root_states[0, :3].cpu().numpy()
-        sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
-
-        if not file_saved:
             log["joint_pos"].append(robot.data.joint_pos[0, :].cpu().numpy().copy())
             log["joint_vel"].append(robot.data.joint_vel[0, :].cpu().numpy().copy())
             log["body_pos_w"].append(robot.data.body_pos_w[0, :].cpu().numpy().copy())
@@ -286,29 +311,36 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
             log["body_lin_vel_w"].append(robot.data.body_lin_vel_w[0, :].cpu().numpy().copy())
             log["body_ang_vel_w"].append(robot.data.body_ang_vel_w[0, :].cpu().numpy().copy())
 
-        if reset_flag and not file_saved:
-            file_saved = True
-            for k in (
-                "joint_pos",
-                "joint_vel",
-                "body_pos_w",
-                "body_quat_w",
-                "body_lin_vel_w",
-                "body_ang_vel_w",
-            ):
-                log[k] = np.stack(log[k], axis=0)
+            if reset_flag:
+                for key in (
+                    "joint_pos",
+                    "joint_vel",
+                    "body_pos_w",
+                    "body_quat_w",
+                    "body_lin_vel_w",
+                    "body_ang_vel_w",
+                ):
+                    log[key] = np.stack(log[key], axis=0)
 
-            np.savez("/tmp/motion.npz", **log)
+                save_path = output_file or Path("/tmp/motion.npz")
+                np.savez(save_path, **log)
+                print(f"[INFO]: Motion saved locally: {save_path}", flush=True)
+                break
 
+        if output_file is None:
             import wandb
 
-            COLLECTION = args_cli.output_name
-            run = wandb.init(project="csv_to_npz", name=COLLECTION)
-            print(f"[INFO]: Logging motion to wandb: {COLLECTION}")
-            REGISTRY = "motions"
-            logged_artifact = run.log_artifact(artifact_or_path="/tmp/motion.npz", name=COLLECTION, type=REGISTRY)
-            run.link_artifact(artifact=logged_artifact, target_path=f"wandb-registry-{REGISTRY}/{COLLECTION}")
-            print(f"[INFO]: Motion saved to wandb registry: {REGISTRY}/{COLLECTION}")
+            collection = args_cli.output_name
+            run = wandb.init(project="csv_to_npz", name=collection)
+            print(f"[INFO]: Logging motion to wandb: {collection}")
+            registry = "motions"
+            logged_artifact = run.log_artifact(artifact_or_path="/tmp/motion.npz", name=collection, type=registry)
+            run.link_artifact(artifact=logged_artifact, target_path=f"wandb-registry-{registry}/{collection}")
+            print(f"[INFO]: Motion saved to wandb registry: {registry}/{collection}")
+
+    if args_cli.output_file or args_cli.output_dir:
+        print(f"[INFO]: Completed {len(jobs)} local conversion(s).", flush=True)
+        os._exit(0)
 
 
 def main():

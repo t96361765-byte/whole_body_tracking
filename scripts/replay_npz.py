@@ -9,6 +9,8 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import pathlib
+
 import numpy as np
 import torch
 
@@ -16,12 +18,18 @@ from isaaclab.app import AppLauncher
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Replay converted motions.")
-parser.add_argument("--registry_name", type=str, required=True, help="The name of the wand registry.")
+motion_source = parser.add_mutually_exclusive_group()
+motion_source.add_argument("--motion_file", type=str, help="Path to a local NPZ motion file.")
+motion_source.add_argument("--registry_name", type=str, help="The name of the WandB registry artifact.")
+parser.add_argument("--robot_file", type=str, help="Optional URDF file to use instead of the default G1 model.")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
+
+if bool(args_cli.motion_file) == bool(args_cli.registry_name):
+    parser.error("Provide exactly one of --motion_file or --registry_name.")
 
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
@@ -41,6 +49,9 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 ##
 from whole_body_tracking.robots.g1 import G1_CYLINDER_CFG
 from whole_body_tracking.tasks.tracking.mdp import MotionLoader
+
+if args_cli.robot_file:
+    G1_CYLINDER_CFG.spawn.asset_path = args_cli.robot_file
 
 
 @configclass
@@ -67,16 +78,18 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Define simulation stepping
     sim_dt = sim.get_physics_dt()
 
-    registry_name = args_cli.registry_name
-    if ":" not in registry_name:  # Check if the registry name includes alias, if not, append ":latest"
-        registry_name += ":latest"
-    import pathlib
+    if args_cli.motion_file:
+        motion_file = args_cli.motion_file
+    else:
+        registry_name = args_cli.registry_name
+        if ":" not in registry_name:  # Check if the registry name includes alias, if not, append ":latest"
+            registry_name += ":latest"
 
-    import wandb
+        import wandb
 
-    api = wandb.Api()
-    artifact = api.artifact(registry_name)
-    motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
+        api = wandb.Api()
+        artifact = api.artifact(registry_name)
+        motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
 
     motion = MotionLoader(
         motion_file,
@@ -92,7 +105,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         time_steps[reset_ids] = 0
 
         root_states = robot.data.default_root_state.clone()
-        root_states[:, :3] = motion.body_pos_w[time_steps][:, 0] + scene.env_origins[:, None, :]
+        root_states[:, :3] = motion.body_pos_w[time_steps][:, 0] + scene.env_origins
         root_states[:, 3:7] = motion.body_quat_w[time_steps][:, 0]
         root_states[:, 7:10] = motion.body_lin_vel_w[time_steps][:, 0]
         root_states[:, 10:] = motion.body_ang_vel_w[time_steps][:, 0]
@@ -109,7 +122,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
 def main():
     sim_cfg = sim_utils.SimulationCfg(device=args_cli.device)
-    sim_cfg.dt = 0.02
+    if args_cli.motion_file:
+        with np.load(args_cli.motion_file, allow_pickle=False) as motion_data:
+            sim_cfg.dt = 1.0 / float(motion_data["fps"][0])
+    else:
+        sim_cfg.dt = 0.02
     sim = SimulationContext(sim_cfg)
 
     scene_cfg = ReplayMotionsSceneCfg(num_envs=1, env_spacing=2.0)
